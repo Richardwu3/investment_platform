@@ -1,5 +1,5 @@
-# AI-Augmented Investment Research Platform
-**Columbia MAFN | Phase 1: GTAA Backtest Engine**
+# FinPilot -- AI-Augmented Investment Research Platform
+**Phase 1: GTAA Backtest Engine**
 
 ## Architecture
 
