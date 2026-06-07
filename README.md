@@ -92,7 +92,6 @@ Generates monthly asset allocation signals based on 6-month momentum.
 
 ## Phase 2: Decision Intelligence Layer(Core Differentiator)
 
-What It Does
 **Logs every AI recommendation**(what, when, confidence)
 
 **Records human decisions**(approve / modify / reject + reason)
