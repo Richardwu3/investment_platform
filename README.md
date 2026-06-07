@@ -1,34 +1,57 @@
-# AI-Augmented Investment Research Platform
-**Columbia MAFN | Phase 1: GTAA Backtest Engine**
+# FinPilot -- AI-Augmented Investment Decision Platform
+**Code = Truth. LLM = Interface. Human = Final Decision.**
+
+## What This Is
+
+FinPilot is an **AI-augmented investment decision platform** that helps individual investors make systematic, traceable allocation decisions.
+
+Unlike typical "AI trading" projects, FinPilot:
+
+- **Does not let LLMs predict markets** (they can't)
+- **Records every decision** (AI said X, human changed to Y, outcome was Z)
+- **Learns from feedback** (when does AI work? when should humans override?)
 
 ## Architecture
 
 ```
-Data Layer → Strategy Layer → Backtest Engine (5 Layers) → AI Agent → Human Review → Decision Logger → Feedback Loop
+Signal Engine (GTAA)
+↓
+AI Explanation
+↓
+Human Review → Decision Log → Outcome Tracking → Performance Review
+↓
+Execution (IBKR)
 ```
 
-### Design Principles
+### Design Philosophy
 | Principle | Implementation |
 |-----------|---------------|
-| Code = Truth | All metrics computed deterministically in Python |
-| LLM = Interface | AI Agent reads output dicts; never modifies strategy state |
-| Human-in-the-Loop | AI generates report, human approves before any order |
-| Look-ahead Free | `shift(1)` at momentum computation + weight execution boundary |
+| **Code = Truth** | All investment signals come from deterministic, backtested rules |
+| **LLM = Interface** | LLM explains, summarizes, researches — never predicts |
+| **Human-in-the-Loop** | AI recommends, human approves/modifies/rejects |
+| **Decision Traceability** | Every recommendation and override is logged |
+| **Feedback Learning** | Outcomes tracked to improve future recommendations |
 
 ---
 
-## Phase 1 File Structure
+## Project Structure
 
 ```
 investment_platform/
-├── strategies/
-│   ├── base.py          # IStrategy abstract class, SignalResult, shared utilities
-│   └── gtaa.py          # GTAA implementation (SPY/QQQ/TLT/GLD/DBC, 126d momentum, Top2)
-├── backtest/
-│   ├── engine.py        # 5-layer validation framework
-│   └── run_first_backtest.py  # Entry point
-├── data/                # Auto-created, CSV price cache
-├── reports/             # Auto-created, output JSON + CSV
+├── strategies/          # Signal Engine
+│   ├── base.py
+│   └── gtaa.py
+├── backtest/            # 5-Layer Validation
+│   ├── engine.py
+│   └── run_first_backtest.py
+├── decisions/           # Decision Intelligence Layer
+│   ├── db.py
+│   ├── analyzer.py
+│   ├── confidence.py
+│   └── cli.py
+├── tests/               # 31 unit tests
+├── data/                # Price cache
+├── reports/             # Backtest outputs
 └── requirements.txt
 ```
 
@@ -37,50 +60,91 @@ investment_platform/
 ## Quick Start
 
 ```bash
-# Install dependencies
+# Install
 pip install -r requirements.txt
 
-# Run full backtest (all 5 layers)
-python backtest/run_first_backtest.py
-
-# Fast mode (skip walk-forward and param sweep)
+# Phase 1: Signal Engine
 python backtest/run_first_backtest.py --fast
 
-# Custom parameters
-python backtest/run_first_backtest.py --start 2015-01-01 --lookback 189 --top-n 3
+# Phase 2: Decision Journal
+python decisions/cli.py seed      # Load demo data
+python decisions/cli.py list      # View history
+python decisions/cli.py analyze   # AI accuracy report
+python decisions/cli.py log       # Record a decision
 ```
 
 ---
+
+## Phase 1: Singal Engine(GTAA)
+Generates monthly asset allocation signals based on 6-month momentum.
 
 ## The 5-Layer Validation Framework
 
 | Layer | Name | Question Answered |
 |-------|------|------------------|
-| 1 | Standard Backtest | Does the strategy have edge over the full sample? |
+| 1 | Standard Backtest | Does the strategy have edge over the full sample?(Sharpe ratio) |
 | 2 | Walk-Forward | Does performance generalize out-of-sample? |
-| 3 | Parameter Stability | Is performance robust to parameter variation? |
+| 3 | Parameter Stability | Is performance robust to parameter variation?(heatmap) |
 | 4 | Market Regime | In which environments does the strategy add value? |
 | 5 | Block Bootstrap | Is performance statistically significant vs. luck? |
 
 ---
 
-## Look-ahead Bias Architecture
+## Phase 2: Decision Intelligence Layer(Core Differentiator)
 
-```
-prices[t-1] ──→ compute_momentum() ──→ scores[t]  ← shift(1) inside function
-                                            │
-                                    equal_weight_top_n()
-                                            │
-                                      weights_raw[t]
-                                            │
-                                       .shift(1)       ← applied by strategy
-                                            │
-                                  execution_weights[t]  ← "hold during day t"
-                                            │
-                              price_return[t] × weight[t]  ← correct!
-```
+What It Does
+**Logs every AI recommendation**(what, when, confidence)
 
-Signal computed at month-end close of day t-1 → applied to returns of day t.
+**Records human decisions**(approve / modify / reject + reason)
+
+**Tracks outcomes**(30-day realized return)
+
+**Measures AI accuracy**by confidence level
+
+**Quantifies human value-add**(did modifications help?)
+
+## CLI Commands
+
+| Command | Purpose |
+|-------|------|
+| seed | Load 8 demo decisions | 
+| list | View decision history | 
+| log | Record AI + human decision | 
+| outcome | Fill realized return | 
+| analyze | Generate analytics report |
+
+## Sample Output
+
+═══ DECISION JOURNAL — ANALYTICS REPORT ═══
+
+[ HUMAN DECISION BREAKDOWN ]
+  Total decisions:    8
+  Approved:           4 (50%)
+  Modified:           3 (37.5%)
+  Rejected:           1 (12.5%)
+
+[ AI ACCURACY ]
+  AI Accuracy Rate:   60%
+  Correct calls:      3 | Mean return: +3.2%
+  Wrong calls:        2 | Mean return: -1.8%
+
+[ HUMAN VALUE-ADD ]
+  Mean value-add:     +0.5%
+  % modifications helpful: 67%
+
+[ CONFIDENCE CALIBRATION ]
+  High confidence (>0.7): 75% accuracy
+  Low confidence (<0.5):  33% accuracy
+
+## Why Not Just Use ChatGPT?
+
+| Feature | ChatGPT | FinPilot |
+|-------|------|------------------|
+| Signal source | "I think" | Backtested rules |
+| Decision record | None | Full traceability |
+| Outcome tracking | None | 30-day follow-up |
+| Auditability | None | Every step logged |
+| Investment philosophy | Black box | Transparent, explainable |
 
 ---
 
@@ -97,16 +161,7 @@ Signal computed at month-end close of day t-1 → applied to returns of day t.
 
 ---
 
-## AI Agent Integration (Phase 2)
+## Author
 
-The engine outputs a structured `results` dict:
-```python
-results["summary"]          # High-level metrics for LLM prompt injection
-results["layer_1"]          # Full metrics + equity curves
-results["layer_5"]          # Statistical significance for narrative
-signal.metadata             # Selected assets, momentum scores per rebalance date
-strategy.get_metadata()     # Strategy description for LLM to explain logic
-```
+Yuchuan Wu
 
-The LLM reads these dicts to generate plain-English research reports.
-It **never** calls `generate_signals()` or modifies numerical results.
