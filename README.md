@@ -1,36 +1,63 @@
-# FinPilot -- AI-Augmented Investment Decision Platform
+# FinPilot -- AI-Human Decision Intelligence System for Investment Management
 **Code = Truth. LLM = Interface. Human = Final Decision.**
 
-## What This Is
+## Problem
 
-FinPilot is an **AI-augmented investment decision platform** that helps individual investors make systematic, traceable allocation decisions.
+Investors increasingly use AI-generated investment advice. But most treat AI as a black box:
 
-Unlike typical "AI trading" projects, FinPilot:
+- AI recommendations are **never tracked**
+- Human overrides are **not measured** 
+- Outcomes are **not linked back to decisions**
 
-- **Does not let LLMs predict markets** (they can't)
-- **Records every decision** (AI said X, human changed to Y, outcome was Z)
-- **Learns from feedback** (when does AI work? when should humans override?)
+Without feedback loops, investors cannot answer the most important question: 
+**When should I trust AI? When should I intervene?**
+
+## Solution
+
+FinPilot creates a **closed-loop decision system**:
+
+AI Recommendation → Human Decision → Execution → Outcome → Review
+
+Every decision is logged. Every override is measured. Every outcome is tracked.
+The system continuously answers:
+
+| Question | How FinPilot Answers |
+|-----------|---------------|
+| **Is AI directionally correct?** | AI Accuracy vs Benchmark |
+| **Do human modifications help or hurt?** | Human Value-Add = Actual - AI only |
+| **In which regimes does AI platform best?** | Regime-conditional accuracy |
+
+### North Star Metrics
+| Metric | Definition | Target |
+|-------|------|------------------|
+| **AI Calibration Error** | Confidence vs actual accuracy | <10% |
+| **Human Value-Add** | Mean (actual - AI only) on overrides | >0 |
+| **Override Rate** | % of decisions modified or rejected | 20-40% |
+| **Decision Review Completion** | % of decisions with post-mortem | >80% |
 
 ## Architecture
 
 ```
-Signal Engine (GTAA)
-↓
-AI Explanation
-↓
-Human Review → Decision Log → Outcome Tracking → Performance Review
-↓
-Execution (IBKR)
+┌─────────────────────────────────────────────────────────────┐
+│                    PHASE 1: SIGNAL ENGINE                    │
+│  GTAA Momentum (Faber 2007) → 5-Layer Validation            │
+│  Universe: SPY, QQQ, TLT, GLD, DBC | Top2 equal weight      │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+┌─────────────────────────────────────────────────────────────┐
+│              PHASE 2: DECISION INTELLIGENCE                  │
+│                                                             │
+│  AI Recommendation (weights + confidence + momentum scores) │
+│           ↓                                                 │
+│  Human Review (approve / modify / reject + reason)          │
+│           ↓                                                 │
+│  Execution Logging (fills: symbol, qty, price, commission)  │
+│           ↓                                                 │
+│  Outcome Tracking (30d return vs benchmark vs AI-only)      │
+│           ↓                                                 │
+│  Review Copilot (Markdown retrospectives)                   │
+└─────────────────────────────────────────────────────────────┘
 ```
-
-### Design Philosophy
-| Principle | Implementation |
-|-----------|---------------|
-| **Code = Truth** | All investment signals come from deterministic, backtested rules |
-| **LLM = Interface** | LLM explains, summarizes, researches — never predicts |
-| **Human-in-the-Loop** | AI recommends, human approves/modifies/rejects |
-| **Decision Traceability** | Every recommendation and override is logged |
-| **Feedback Learning** | Outcomes tracked to improve future recommendations |
 
 ---
 
@@ -48,7 +75,8 @@ investment_platform/
 │   ├── db.py
 │   ├── analyzer.py
 │   ├── confidence.py
-│   └── cli.py
+│   ├── cli.py
+│   └── review_copilot.py
 ├── tests/               # 31 unit tests
 ├── data/                # Price cache
 ├── reports/             # Backtest outputs
@@ -66,84 +94,102 @@ pip install -r requirements.txt
 # Phase 1: Signal Engine
 python backtest/run_first_backtest.py --fast
 
-# Phase 2: Decision Journal
-python decisions/cli.py seed      # Load demo data
-python decisions/cli.py list      # View history
-python decisions/cli.py analyze   # AI accuracy report
-python decisions/cli.py log       # Record a decision
+# Phase 2: Decision Journal (30 seconds to see value)
+# 1. Load demo data (8 decisions with fills + outcomes)
+python decisions/cli.py seed
+
+# 2. See a complete decision lifecycle 
+python decisions/cli.py trace --id 2
+
+# 3. Generate an AI-powered review report
+python decisions/cli.py review --id 2
+
+# 4. Run full analytics
+python decisions/cli.py analyze
 ```
 
 ---
 
-## Phase 1: Singal Engine(GTAA)
-Generates monthly asset allocation signals based on 6-month momentum.
-
-## The 5-Layer Validation Framework
-
-| Layer | Name | Question Answered |
-|-------|------|------------------|
-| 1 | Standard Backtest | Does the strategy have edge over the full sample?(Sharpe ratio) |
-| 2 | Walk-Forward | Does performance generalize out-of-sample? |
-| 3 | Parameter Stability | Is performance robust to parameter variation?(heatmap) |
-| 4 | Market Regime | In which environments does the strategy add value? |
-| 5 | Block Bootstrap | Is performance statistically significant vs. luck? |
-
----
-
-## Phase 2: Decision Intelligence Layer(Core Differentiator)
-
-**Logs every AI recommendation**(what, when, confidence)
-
-**Records human decisions**(approve / modify / reject + reason)
-
-**Tracks outcomes**(30-day realized return)
-
-**Measures AI accuracy**by confidence level
-
-**Quantifies human value-add**(did modifications help?)
-
-## CLI Commands
+## CLI Reference
 
 | Command | Purpose |
 |-------|------|
 | seed | Load 8 demo decisions | 
-| list | View decision history | 
-| log | Record AI + human decision | 
-| outcome | Fill realized return | 
-| analyze | Generate analytics report |
+| trace --id N | Complete lifecycle | 
+| review --id N | Generate Markdown report | 
+| analyze | Full analytics report | 
+| log| Record a new decision | 
+| exec --id N ...| Log a fill| 
+| outcome --id N --return X| Record 30d result | 
+| list | View history | 
+
 
 ## Sample Output
 
-═══ DECISION JOURNAL — ANALYTICS REPORT ═══
+trace --id 2
+
+═══════════════════════════════════════════════════════════════
+  FULL DECISION TRACE — #2
+═══════════════════════════════════════════════════════════════
+
+  ● DECISION (2024-02-29)
+  ├─ AI: SPY 50% | QQQ 50% (confidence: 76%)
+  ├─ Human: MODIFIED → SPY 50% | GLD 50%
+  └─ Reason: "Concerned about tech concentration; adding gold"
+
+  ● EXECUTIONS (2 fills)
+  ├─ BUY SPY × 11.9 @ $505.10
+  └─ BUY GLD × 25.2 @ $189.30
+
+  ● OUTCOME (30d)
+  ├─ Actual: +2.8% | Benchmark: +3.2% | Excess: -0.4%
+  ├─ AI-only: +2.1% | Human Value-Add: +0.7%
+  └─ Verdict: ✓ AI direction correct | Human improved outcome
+
+analyze
 
 [ HUMAN DECISION BREAKDOWN ]
   Total decisions:    8
   Approved:           4 (50%)
-  Modified:           3 (37.5%)
-  Rejected:           1 (12.5%)
+  Modified:           3 (38%)
+  Rejected:           1 (12%)
 
 [ AI ACCURACY ]
   AI Accuracy Rate:   60%
-  Correct calls:      3 | Mean return: +3.2%
-  Wrong calls:        2 | Mean return: -1.8%
+  Correct calls mean return: +3.2%
+  Wrong calls mean return:   -1.8%
 
 [ HUMAN VALUE-ADD ]
-  Mean value-add:     +0.5%
+  Modifications with outcomes: 3
+  Mean value-add: +0.5%
   % modifications helpful: 67%
-
-[ CONFIDENCE CALIBRATION ]
-  High confidence (>0.7): 75% accuracy
-  Low confidence (<0.5):  33% accuracy
+  Cumulative human alpha: +1.5%
 
 ## Why Not Just Use ChatGPT?
 
 | Feature | ChatGPT | FinPilot |
 |-------|------|------------------|
-| Signal source | "I think" | Backtested rules |
-| Decision record | None | Full traceability |
-| Outcome tracking | None | 30-day follow-up |
-| Auditability | None | Every step logged |
-| Investment philosophy | Black box | Transparent, explainable |
+| Signal source | "I think" | Backtested momentum |
+| Decision record | Lost in chat | SQLite database |
+| Outcome tracking | None | 30-day follow-up + benchmark |
+| Human value-add | Can't measure | Actual - AI-only |
+| Post-mortem | Manual | Automated Markdown |
+| Auditability | None | Full traceability |
+| LLM role | Market prediction (dangerous) | Narrative only |
+
+---
+
+## Tech Stack
+
+**Signal Engine:** Python, pandas numpy
+
+**Backtest:** 5-layer validation (walk-forward, regime analysis, bootstrap)
+
+**Decision Layer:** SQLite, custom CLI
+
+**LLM integration:** Anthropic Claude API (fallback to rule-based)
+
+**Tests:** 60+ unit tests
 
 ---
 

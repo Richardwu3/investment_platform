@@ -8,21 +8,26 @@ data access operations. This module is the ONLY place that touches
 the database — CLI and analyzer import from here, never write SQL directly.
 
 Schema Design Rationale:
-    decisions table  : Captures the state at decision time (what AI recommended,
-                       what human decided, why). Immutable after creation except
-                       for execution_price which may be filled post-approval.
-    outcomes table   : Captures results 30 days later. Separate because the data
-                       arrives at a different point in time — filling it at
-                       decision time would require a time machine.
-    rebalance_cycles : Groups multiple decisions made in the same monthly cycle,
-                       enabling cycle-level analysis (not just decision-level).
+    rebalance_cycles : Groups decisions by monthly event. One cycle = one rebalance.
+    decisions        : One row per allocation decision (AI signal + human review).
+                       Immutable after creation except execution_price (post-fill).
+    outcomes         : Realized results recorded ~30 days later. Separated because
+                       results arrive at a different time than the decision.
+    executions       : Individual order fills. One decision → many execution legs.
+                       Tracks broker-level detail: symbol, side, qty, fill price,
+                       commission. Separate from decisions because:
+                         (a) execution is post-approval, not concurrent with decision
+                         (b) one allocation decision may generate multiple fills
+                         (c) fills may arrive over minutes/hours (partial fills)
 
-ai_correct Definition (fixes the schema ambiguity in original spec):
-    We define "AI correct" as a 3-way enum, not a boolean:
-        'direction_correct'  — AI picked an asset that had positive return
-        'direction_wrong'    — AI picked an asset that had negative return
-        'inconclusive'       — Return too small to distinguish signal from noise (<0.5%)
-    This is stored as TEXT in SQLite. The analyzer maps it to numeric scores.
+ai_correct Definition:
+    'direction_correct' — realized return > +0.5%
+    'direction_wrong'   — realized return < -0.5%
+    'inconclusive'      — |return| < 0.5%, noise floor
+
+commission_type in executions:
+    'flat' — fixed dollar amount per fill (e.g. $1.00)
+    'bps'  — basis points of notional (e.g. 0.5 bps = 0.00005 × notional)
 
 Author: Yuchuan Wu — Phase 2
 """
@@ -33,14 +38,14 @@ import json
 import logging
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, date
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Generator, List, Optional
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Schema DDL
+# Schema DDL — append-only; existing tables unchanged by new additions
 # ---------------------------------------------------------------------------
 
 SCHEMA_SQL = """
@@ -49,45 +54,32 @@ SCHEMA_SQL = """
 -- ──────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS rebalance_cycles (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    cycle_date      TEXT    NOT NULL,          -- YYYY-MM-DD, month-end signal date
-    strategy        TEXT    NOT NULL,          -- e.g. 'GTAA_126d_Top2'
-    market_regime   TEXT,                      -- 'bull' | 'bear' | 'sideways' (from Layer 4)
+    cycle_date      TEXT    NOT NULL,
+    strategy        TEXT    NOT NULL,
+    market_regime   TEXT,
     notes           TEXT,
     created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
 -- ──────────────────────────────────────────────────────────────────────────
--- decisions: one row per asset position in a rebalance cycle
+-- decisions: one row per asset-allocation decision
 -- ──────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS decisions (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-
-    -- Linkage
     cycle_id                INTEGER REFERENCES rebalance_cycles(id),
-    date                    TEXT    NOT NULL,   -- YYYY-MM-DD signal date
-
-    -- Strategy identification
+    date                    TEXT    NOT NULL,
     strategy                TEXT    NOT NULL,
-
-    -- AI recommendation (what the model said)
-    ai_signal               TEXT    NOT NULL,   -- JSON: {"SPY": 0.5, "TLT": 0.5}
-    ai_confidence           REAL,              -- 0.0–1.0, derived from momentum spread
-    ai_confidence_method    TEXT,              -- how confidence was computed
-    ai_momentum_scores      TEXT,              -- JSON: {"SPY": 0.08, "QQQ": 0.04, ...}
-    ai_selected_assets      TEXT,              -- JSON array: ["SPY", "TLT"]
-
-    -- Human decision
-    human_decision          TEXT    NOT NULL   -- 'approve' | 'modify' | 'reject'
+    ai_signal               TEXT    NOT NULL,
+    ai_confidence           REAL,
+    ai_confidence_method    TEXT,
+    ai_momentum_scores      TEXT,
+    ai_selected_assets      TEXT,
+    human_decision          TEXT    NOT NULL
                             CHECK (human_decision IN ('approve', 'modify', 'reject')),
-    human_weights           TEXT,              -- JSON: actual weights after human review
-                                               -- NULL if approved (use ai_signal) or rejected
-    human_reason            TEXT,              -- free text: why modified or rejected
-
-    -- Execution (filled after order placed, may be NULL at decision time)
-    execution_price         TEXT,              -- JSON: {"SPY": 412.5, "TLT": 98.2}
-    executed_at             TEXT,              -- ISO datetime of execution
-
-    -- Metadata
+    human_weights           TEXT,
+    human_reason            TEXT,
+    execution_price         TEXT,
+    executed_at             TEXT,
     created_at              TEXT    NOT NULL DEFAULT (datetime('now')),
     updated_at              TEXT    NOT NULL DEFAULT (datetime('now'))
 );
@@ -96,35 +88,68 @@ CREATE TABLE IF NOT EXISTS decisions (
 -- outcomes: one row per decision, filled ~30 days later
 -- ──────────────────────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS outcomes (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    decision_id         INTEGER NOT NULL UNIQUE REFERENCES decisions(id),
-
-    -- Realized performance
-    actual_return_30d   REAL,              -- portfolio return 30 calendar days after decision
-    benchmark_return_30d REAL,            -- SPY return over same window (for excess return)
-    asset_returns       TEXT,             -- JSON: {"SPY": 0.03, "TLT": -0.01, ...}
-
-    -- AI accuracy assessment (3-way enum, not boolean — see module docstring)
-    ai_correct          TEXT              -- 'direction_correct' | 'direction_wrong' | 'inconclusive'
-                        CHECK (ai_correct IN ('direction_correct', 'direction_wrong',
-                                              'inconclusive', NULL)),
-
-    -- Counterfactual: what would have happened with pure AI weights
-    ai_only_return_30d  REAL,            -- return using ai_signal weights (ignoring human mod)
-    human_value_add     REAL,            -- actual_return_30d - ai_only_return_30d
-
-    -- Metadata
-    outcome_date        TEXT,            -- date the outcome was recorded
-    notes               TEXT,
-    created_at          TEXT    NOT NULL DEFAULT (datetime('now'))
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id          INTEGER NOT NULL UNIQUE REFERENCES decisions(id),
+    actual_return_30d    REAL,
+    benchmark_return_30d REAL,
+    asset_returns        TEXT,
+    ai_correct           TEXT
+                         CHECK (ai_correct IN ('direction_correct', 'direction_wrong',
+                                               'inconclusive', NULL)),
+    ai_only_return_30d   REAL,
+    human_value_add      REAL,
+    outcome_date         TEXT,
+    notes                TEXT,
+    created_at           TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
 -- ──────────────────────────────────────────────────────────────────────────
--- Indexes for common query patterns
+-- executions: broker-level fill records linked to a decision
+--
+-- One decision → one or many executions (one per symbol leg, or partial fills).
+-- Only non-rejected decisions should have executions — enforced at app layer
+-- because SQLite CHECK can't join across tables.
+--
+-- Fields:
+--   symbol          : ticker symbol (e.g. 'SPY')
+--   side            : 'buy' | 'sell' | 'sell_short'
+--   quantity        : number of shares / units (REAL to support fractional)
+--   price           : fill price per unit in USD
+--   net_amount      : quantity × price ± commission (signed, negative = cash out)
+--   commission      : absolute commission cost in USD (always positive)
+--   commission_type : 'flat' (fixed $) | 'bps' (basis points of notional)
+--   broker          : broker identifier (e.g. 'alpaca', 'ibkr', 'paper')
+--   order_id        : broker-assigned order reference for reconciliation
+--   execution_time  : ISO datetime of fill
 -- ──────────────────────────────────────────────────────────────────────────
-CREATE INDEX IF NOT EXISTS idx_decisions_date     ON decisions(date);
-CREATE INDEX IF NOT EXISTS idx_decisions_strategy ON decisions(strategy);
-CREATE INDEX IF NOT EXISTS idx_outcomes_decision  ON outcomes(decision_id);
+CREATE TABLE IF NOT EXISTS executions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    decision_id     INTEGER NOT NULL REFERENCES decisions(id),
+    symbol          TEXT    NOT NULL,
+    side            TEXT    NOT NULL
+                    CHECK (side IN ('buy', 'sell', 'sell_short')),
+    quantity        REAL    NOT NULL CHECK (quantity > 0),
+    price           REAL    NOT NULL CHECK (price > 0),
+    net_amount      REAL,
+    commission      REAL    NOT NULL DEFAULT 0.0 CHECK (commission >= 0),
+    commission_type TEXT    NOT NULL DEFAULT 'flat'
+                    CHECK (commission_type IN ('flat', 'bps')),
+    broker          TEXT    NOT NULL DEFAULT 'paper',
+    order_id        TEXT,
+    execution_time  TEXT    NOT NULL,
+    notes           TEXT,
+    created_at      TEXT    NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ──────────────────────────────────────────────────────────────────────────
+-- Indexes
+-- ──────────────────────────────────────────────────────────────────────────
+CREATE INDEX IF NOT EXISTS idx_decisions_date      ON decisions(date);
+CREATE INDEX IF NOT EXISTS idx_decisions_strategy  ON decisions(strategy);
+CREATE INDEX IF NOT EXISTS idx_outcomes_decision   ON outcomes(decision_id);
+CREATE INDEX IF NOT EXISTS idx_executions_decision ON executions(decision_id);
+CREATE INDEX IF NOT EXISTS idx_executions_symbol   ON executions(symbol);
+CREATE INDEX IF NOT EXISTS idx_executions_time     ON executions(execution_time);
 """
 
 
@@ -138,11 +163,6 @@ class Database:
 
     Handles connection lifecycle, schema initialization, and provides
     a context-managed connection for safe transaction handling.
-
-    All methods enforce:
-        - Parameterized queries (no string formatting with user input)
-        - Explicit commit/rollback
-        - Structured logging on every write operation
 
     Usage::
 
@@ -165,10 +185,7 @@ class Database:
 
     def _initialize_schema(self) -> None:
         """
-        Create tables and indexes if they don't exist.
-
-        Idempotent — safe to call on every startup.
-        Uses IF NOT EXISTS throughout.
+        Create tables and indexes if they don't exist. Idempotent.
         """
         with self.connect() as conn:
             conn.executescript(SCHEMA_SQL)
@@ -186,17 +203,12 @@ class Database:
             sqlite3.Connection with row_factory set.
 
         Raises:
-            sqlite3.Error: Re-raised after rollback on any database error.
-
-        Example::
-
-            with db.connect() as conn:
-                rows = conn.execute("SELECT * FROM decisions").fetchall()
+            sqlite3.Error: Re-raised after rollback.
         """
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode=WAL")   # Better concurrent read performance
-        conn.execute("PRAGMA foreign_keys=ON")    # Enforce FK constraints
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
         try:
             yield conn
             conn.commit()
@@ -209,15 +221,15 @@ class Database:
 
 
 # ---------------------------------------------------------------------------
-# Data Access Objects
+# Data Access Object
 # ---------------------------------------------------------------------------
 
 class DecisionRepository:
     """
-    All read/write operations for the decisions and outcomes tables.
+    All read/write operations for decisions, outcomes, and executions.
 
-    This is the single source of truth for database interactions.
-    CLI and Analyzer call methods here; they never write raw SQL.
+    Single source of truth for database interactions. CLI, analyzer,
+    and review_copilot import from here; they never write raw SQL.
     """
 
     def __init__(self, db: Database) -> None:
@@ -244,7 +256,7 @@ class DecisionRepository:
         Args:
             cycle_date:    Month-end signal date (YYYY-MM-DD).
             strategy:      Strategy name (e.g. 'GTAA_126d_Top2').
-            market_regime: Optional regime label from Layer 4.
+            market_regime: Optional regime label from Layer 4 ('bull'|'bear'|'sideways').
             notes:         Free-text notes.
 
         Returns:
@@ -257,8 +269,7 @@ class DecisionRepository:
         with self.db.connect() as conn:
             cursor = conn.execute(sql, (cycle_date, strategy, market_regime, notes))
             cycle_id = cursor.lastrowid
-
-        logger.info("Created rebalance cycle id=%d for %s on %s", cycle_id, strategy, cycle_date)
+        logger.info("Created cycle id=%d for %s on %s", cycle_id, strategy, cycle_date)
         return cycle_id
 
     # ------------------------------------------------------------------
@@ -284,18 +295,18 @@ class DecisionRepository:
         Record a single asset-allocation decision with AI and human components.
 
         Args:
-            date:                  Signal date (YYYY-MM-DD).
-            strategy:              Strategy identifier.
-            ai_signal:             AI-recommended weights dict {ticker: weight}.
-            human_decision:        One of 'approve' | 'modify' | 'reject'.
-            ai_confidence:         Float [0,1] representing model confidence.
-            ai_confidence_method:  How confidence was computed (for reproducibility).
-            ai_momentum_scores:    Raw momentum scores per asset.
-            ai_selected_assets:    List of assets AI chose.
-            human_weights:         Modified weights if human_decision == 'modify'.
-            human_reason:          Explanation of modification or rejection.
-            execution_price:       Actual fill prices {ticker: price}, if known.
-            cycle_id:              FK to rebalance_cycles. Optional.
+            date:                 Signal date (YYYY-MM-DD).
+            strategy:             Strategy identifier.
+            ai_signal:            AI-recommended weights dict {ticker: weight}.
+            human_decision:       One of 'approve' | 'modify' | 'reject'.
+            ai_confidence:        Float [0,1] representing model confidence.
+            ai_confidence_method: How confidence was computed.
+            ai_momentum_scores:   Raw momentum scores per asset.
+            ai_selected_assets:   List of assets AI chose.
+            human_weights:        Modified weights if human_decision == 'modify'.
+            human_reason:         Explanation of modification or rejection.
+            execution_price:      Actual fill prices {ticker: price}, if known.
+            cycle_id:             FK to rebalance_cycles. Optional.
 
         Returns:
             Integer ID of the newly created decision record.
@@ -305,35 +316,26 @@ class DecisionRepository:
                         when human_decision == 'modify'.
             sqlite3.Error: On database write failure.
         """
-        # --- Validation ---
-        valid_decisions = {"approve", "modify", "reject"}
-        if human_decision not in valid_decisions:
-            raise ValueError(
-                f"human_decision must be one of {valid_decisions}, got '{human_decision}'"
-            )
+        valid = {"approve", "modify", "reject"}
+        if human_decision not in valid:
+            raise ValueError(f"human_decision must be one of {valid}, got '{human_decision}'")
         if human_decision == "modify" and human_weights is None:
             raise ValueError(
-                "human_weights must be provided when human_decision == 'modify'. "
-                "If rejecting, use human_decision='reject' instead."
+                "human_weights must be provided when human_decision == 'modify'."
             )
 
-        # --- Serialize JSON fields ---
         sql = """
             INSERT INTO decisions (
                 cycle_id, date, strategy,
                 ai_signal, ai_confidence, ai_confidence_method,
                 ai_momentum_scores, ai_selected_assets,
-                human_decision, human_weights, human_reason,
-                execution_price
+                human_decision, human_weights, human_reason, execution_price
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         params = (
-            cycle_id,
-            date,
-            strategy,
+            cycle_id, date, strategy,
             json.dumps(ai_signal),
-            ai_confidence,
-            ai_confidence_method,
+            ai_confidence, ai_confidence_method,
             json.dumps(ai_momentum_scores) if ai_momentum_scores else None,
             json.dumps(ai_selected_assets) if ai_selected_assets else None,
             human_decision,
@@ -341,14 +343,12 @@ class DecisionRepository:
             human_reason,
             json.dumps(execution_price) if execution_price else None,
         )
-
         with self.db.connect() as conn:
             cursor = conn.execute(sql, params)
             decision_id = cursor.lastrowid
-
         logger.info(
             "Logged decision id=%d | date=%s | strategy=%s | human=%s",
-            decision_id, date, strategy, human_decision
+            decision_id, date, strategy, human_decision,
         )
         return decision_id
 
@@ -359,10 +359,7 @@ class DecisionRepository:
         executed_at: Optional[str] = None,
     ) -> None:
         """
-        Fill in execution prices after order placement.
-
-        These are not known at decision time in a Human-in-the-Loop workflow,
-        so this method exists to update the record post-execution.
+        Fill in execution prices after order placement (post-approval update).
 
         Args:
             decision_id:     ID of the decision to update.
@@ -381,13 +378,13 @@ class DecisionRepository:
 
     def get_decision(self, decision_id: int) -> Optional[Dict]:
         """
-        Fetch a single decision by ID.
+        Fetch a single decision by ID with deserialized JSON fields.
 
         Args:
             decision_id: Primary key of the decision.
 
         Returns:
-            Dict with all decision fields (JSON fields deserialized), or None if not found.
+            Dict with all fields (JSON fields deserialized), or None if not found.
         """
         with self.db.connect() as conn:
             row = conn.execute(
@@ -405,20 +402,19 @@ class DecisionRepository:
         offset: int = 0,
     ) -> List[Dict]:
         """
-        List decisions with optional filters.
+        List decisions with optional filters, joined with outcome summary.
 
         Args:
-            strategy:       Filter by strategy name. None = all strategies.
-            human_decision: Filter by human decision type. None = all types.
+            strategy:       Filter by strategy name. None = all.
+            human_decision: Filter by decision type. None = all.
             limit:          Max rows to return.
-            offset:         Rows to skip (for pagination).
+            offset:         Rows to skip (pagination).
 
         Returns:
-            List of decision dicts, ordered by date descending.
+            List of dicts ordered by date descending.
         """
         conditions: List[str] = []
         params: List[Any] = []
-
         if strategy:
             conditions.append("strategy = ?")
             params.append(strategy)
@@ -436,18 +432,18 @@ class DecisionRepository:
             LIMIT ? OFFSET ?
         """
         params.extend([limit, offset])
-
         with self.db.connect() as conn:
             rows = conn.execute(sql, params).fetchall()
-
         return [self._deserialize_decision(dict(r)) for r in rows]
 
     def get_pending_outcomes(self, days_threshold: int = 30) -> List[Dict]:
         """
-        Find decisions that are old enough for outcome recording but not yet recorded.
+        Find decisions old enough for outcome recording but not yet recorded.
+
+        Uses ISO date comparison (safe for YYYY-MM-DD strings in SQLite).
 
         Args:
-            days_threshold: Minimum age in calendar days before outcome is due.
+            days_threshold: Minimum age in calendar days.
 
         Returns:
             List of decision dicts without a corresponding outcomes row.
@@ -482,8 +478,8 @@ class DecisionRepository:
         Record the realized outcome for a past decision.
 
         Automatically computes:
-            - ai_correct: based on sign of actual_return_30d vs threshold
-            - human_value_add: actual_return - ai_only_return (if both provided)
+            ai_correct      : 3-way classification based on return magnitude
+            human_value_add : actual_return - ai_only_return (if counterfactual provided)
 
         Args:
             decision_id:          FK to decisions table.
@@ -497,27 +493,23 @@ class DecisionRepository:
             Integer ID of the outcomes record.
 
         Raises:
-            ValueError:     If decision_id not found or outcome already exists.
-            sqlite3.Error:  On database error.
+            ValueError:    If decision_id not found or outcome already exists.
+            sqlite3.Error: On database error.
         """
-        # Verify decision exists
         decision = self.get_decision(decision_id)
         if decision is None:
             raise ValueError(f"Decision id={decision_id} not found.")
 
-        # Check for duplicate
         with self.db.connect() as conn:
             existing = conn.execute(
                 "SELECT id FROM outcomes WHERE decision_id = ?", (decision_id,)
             ).fetchone()
         if existing:
             raise ValueError(
-                f"Outcome already recorded for decision id={decision_id}. "
-                "Use update_outcome() to modify."
+                f"Outcome already recorded for decision id={decision_id}."
             )
 
-        # Compute ai_correct based on defined threshold
-        INCONCLUSIVE_THRESHOLD = 0.005  # 0.5% — below this, signal is noise
+        INCONCLUSIVE_THRESHOLD = 0.005
         if abs(actual_return_30d) < INCONCLUSIVE_THRESHOLD:
             ai_correct = "inconclusive"
         elif actual_return_30d > 0:
@@ -536,24 +528,16 @@ class DecisionRepository:
                 human_value_add, outcome_date, notes
             ) VALUES (?, ?, ?, ?, ?, ?, ?, date('now'), ?)
         """
-        params = (
-            decision_id,
-            actual_return_30d,
-            benchmark_return_30d,
-            json.dumps(asset_returns) if asset_returns else None,
-            ai_correct,
-            ai_only_return_30d,
-            human_value_add,
-            notes,
-        )
-
         with self.db.connect() as conn:
-            cursor = conn.execute(sql, params)
+            cursor = conn.execute(sql, (
+                decision_id, actual_return_30d, benchmark_return_30d,
+                json.dumps(asset_returns) if asset_returns else None,
+                ai_correct, ai_only_return_30d, human_value_add, notes,
+            ))
             outcome_id = cursor.lastrowid
-
         logger.info(
             "Logged outcome id=%d for decision id=%d | return=%.2f%% | ai_correct=%s",
-            outcome_id, decision_id, actual_return_30d * 100, ai_correct
+            outcome_id, decision_id, actual_return_30d * 100, ai_correct,
         )
         return outcome_id
 
@@ -562,7 +546,7 @@ class DecisionRepository:
         Fetch all decisions with their outcomes (LEFT JOIN).
 
         Returns:
-            List of merged decision+outcome dicts.
+            List of merged dicts ordered by date descending.
             Decisions without outcomes have None for outcome fields.
         """
         sql = """
@@ -581,6 +565,216 @@ class DecisionRepository:
         return [self._deserialize_decision(dict(r)) for r in rows]
 
     # ------------------------------------------------------------------
+    # Execution operations  (NEW in Phase 2.2)
+    # ------------------------------------------------------------------
+
+    def add_execution(
+        self,
+        decision_id: int,
+        symbol: str,
+        side: str,
+        quantity: float,
+        price: float,
+        execution_time: str,
+        commission: float = 0.0,
+        commission_type: str = "flat",
+        broker: str = "paper",
+        order_id: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> int:
+        """
+        Record a single broker fill associated with a decision.
+
+        One decision may generate multiple execution records (one per symbol leg,
+        or multiple records per symbol for partial fills). The net_amount is
+        computed automatically as (quantity × price) + commission, signed by side:
+        buys are cash-out (negative net_amount from cash perspective),
+        sells are cash-in (positive net_amount).
+
+        Args:
+            decision_id:     FK to decisions table. Must exist and be non-rejected.
+            symbol:          Ticker symbol (e.g. 'SPY').
+            side:            Trade direction: 'buy' | 'sell' | 'sell_short'.
+            quantity:        Number of shares/units (must be > 0).
+            price:           Fill price per unit in USD (must be > 0).
+            execution_time:  ISO datetime of fill (e.g. '2024-01-31T09:31:00').
+            commission:      Commission cost in USD (default 0.0).
+            commission_type: 'flat' (fixed $) or 'bps' (basis points of notional).
+            broker:          Broker identifier (default 'paper').
+            order_id:        Broker-assigned reference string for reconciliation.
+            notes:           Free-text notes.
+
+        Returns:
+            Integer ID of the newly created execution record.
+
+        Raises:
+            ValueError: If decision_id not found, decision is rejected,
+                        side is invalid, quantity or price are non-positive.
+            sqlite3.Error: On database write failure.
+        """
+        valid_sides = {"buy", "sell", "sell_short"}
+        if side not in valid_sides:
+            raise ValueError(f"side must be one of {valid_sides}, got '{side}'")
+        if quantity <= 0:
+            raise ValueError(f"quantity must be > 0, got {quantity}")
+        if price <= 0:
+            raise ValueError(f"price must be > 0, got {price}")
+
+        decision = self.get_decision(decision_id)
+        if decision is None:
+            raise ValueError(f"Decision id={decision_id} not found.")
+        if decision["human_decision"] == "reject":
+            raise ValueError(
+                f"Decision id={decision_id} was rejected — cannot log executions "
+                "for a rejected decision."
+            )
+
+        # Compute net_amount: buys cost cash (negative), sells return cash (positive)
+        notional = quantity * price
+        if commission_type == "bps":
+            # commission argument is interpreted as basis points, convert to dollars
+            commission_dollars = notional * (commission / 10_000)
+        else:
+            commission_dollars = commission
+
+        if side == "buy":
+            net_amount = -(notional + commission_dollars)
+        else:  # sell or sell_short
+            net_amount = notional - commission_dollars
+
+        sql = """
+            INSERT INTO executions (
+                decision_id, symbol, side, quantity, price,
+                net_amount, commission, commission_type,
+                broker, order_id, execution_time, notes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        with self.db.connect() as conn:
+            cursor = conn.execute(sql, (
+                decision_id, symbol, side, quantity, price,
+                net_amount, commission_dollars, commission_type,
+                broker, order_id, execution_time, notes,
+            ))
+            execution_id = cursor.lastrowid
+
+        logger.info(
+            "Logged execution id=%d | decision=%d | %s %s %.2f @ %.2f | net=%.2f",
+            execution_id, decision_id, side.upper(), symbol, quantity, price, net_amount,
+        )
+        return execution_id
+
+    def get_executions_by_decision(self, decision_id: int) -> List[Dict]:
+        """
+        Fetch all execution records for a given decision, ordered by time.
+
+        Args:
+            decision_id: FK to decisions table.
+
+        Returns:
+            List of execution dicts (may be empty if no fills recorded yet).
+            Each dict has keys: id, decision_id, symbol, side, quantity, price,
+            net_amount, commission, commission_type, broker, order_id,
+            execution_time, notes, created_at.
+        """
+        sql = """
+            SELECT *
+            FROM executions
+            WHERE decision_id = ?
+            ORDER BY execution_time ASC, id ASC
+        """
+        with self.db.connect() as conn:
+            rows = conn.execute(sql, (decision_id,)).fetchall()
+        return [dict(r) for r in rows]
+
+    def get_full_trace(self, decision_id: int) -> Optional[Dict]:
+        """
+        Return the complete lifecycle of a decision as a single structured dict.
+
+        Assembles: decision → rebalance_cycle → executions → outcome
+        into a nested dict optimized for display (CLI trace command) and
+        narrative generation (review_copilot).
+
+        Args:
+            decision_id: Primary key of the decision.
+
+        Returns:
+            Dict with keys:
+                decision        : full decision dict (deserialized)
+                cycle           : rebalance_cycle dict, or None
+                executions      : list of execution dicts (may be empty)
+                outcome         : outcome dict, or None
+                execution_summary : {
+                    total_legs      : int,
+                    total_notional  : float,
+                    total_commission: float,
+                    symbols_traded  : list[str],
+                    brokers_used    : list[str],
+                    first_fill_time : str | None,
+                    last_fill_time  : str | None,
+                }
+            Returns None if decision_id not found.
+
+        Example::
+
+            trace = repo.get_full_trace(3)
+            # trace["decision"]["human_decision"] == "modify"
+            # trace["executions"][0]["symbol"] == "SPY"
+            # trace["outcome"]["actual_return_30d"] == 0.034
+        """
+        decision = self.get_decision(decision_id)
+        if decision is None:
+            return None
+
+        # Fetch cycle if linked
+        cycle = None
+        if decision.get("cycle_id"):
+            with self.db.connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM rebalance_cycles WHERE id = ?",
+                    (decision["cycle_id"],),
+                ).fetchone()
+            if row:
+                cycle = dict(row)
+
+        # Fetch executions
+        executions = self.get_executions_by_decision(decision_id)
+
+        # Fetch outcome
+        outcome = None
+        with self.db.connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM outcomes WHERE decision_id = ?", (decision_id,)
+            ).fetchone()
+        if row:
+            outcome = self._deserialize_decision(dict(row))
+
+        # Build execution summary
+        total_notional = sum(abs(e.get("net_amount") or 0.0) for e in executions)
+        total_commission = sum(e.get("commission") or 0.0 for e in executions)
+        symbols = list(dict.fromkeys(e["symbol"] for e in executions))  # order-preserving unique
+        brokers = list(dict.fromkeys(e["broker"] for e in executions))
+        fill_times = [e["execution_time"] for e in executions if e.get("execution_time")]
+
+        execution_summary = {
+            "total_legs": len(executions),
+            "total_notional": round(total_notional, 2),
+            "total_commission": round(total_commission, 4),
+            "symbols_traded": symbols,
+            "brokers_used": brokers,
+            "first_fill_time": min(fill_times) if fill_times else None,
+            "last_fill_time": max(fill_times) if fill_times else None,
+        }
+
+        logger.debug("Full trace assembled for decision id=%d", decision_id)
+        return {
+            "decision": decision,
+            "cycle": cycle,
+            "executions": executions,
+            "outcome": outcome,
+            "execution_summary": execution_summary,
+        }
+
+    # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
@@ -597,12 +791,12 @@ class DecisionRepository:
         """
         json_fields = [
             "ai_signal", "ai_momentum_scores", "ai_selected_assets",
-            "human_weights", "execution_price", "asset_returns"
+            "human_weights", "execution_price", "asset_returns",
         ]
         for field in json_fields:
             if field in row and isinstance(row[field], str):
                 try:
                     row[field] = json.loads(row[field])
                 except (json.JSONDecodeError, TypeError):
-                    pass  # Leave as-is if not valid JSON
+                    pass
         return row
